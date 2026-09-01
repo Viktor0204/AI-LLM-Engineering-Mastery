@@ -18,3 +18,7 @@ chroma.sqlite3
 
 # Other
 .DS_Store
+rag_fundamentals/chroma_db/
+langchain-fundamentals/chroma_db/
+langchain-fundamentals/downloads/
+langchain-fundamentals/subtitles/
