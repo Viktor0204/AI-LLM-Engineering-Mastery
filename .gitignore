@@ -22,3 +22,5 @@ rag_fundamentals/chroma_db/
 langchain-fundamentals/chroma_db/
 langchain-fundamentals/downloads/
 langchain-fundamentals/subtitles/
+advanced-rag/chromadb/
+advanced-rag/data/

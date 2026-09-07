@@ -3,16 +3,14 @@ from typing import List, Dict, Tuple, Any
 from dotenv import load_dotenv
 from langchain_community.document_loaders import PyPDFLoader, DirectoryLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_openai import OpenAIEmbeddings, ChatOpenAI
+from langchain_ollama import OllamaEmbeddings, ChatOllama
 from langchain_core.documents import Document
-
 from langchain_core.prompts.prompt import PromptTemplate
-from langchain_chroma import Chroma  # Updated import
-
+from langchain_chroma import Chroma
 from chromadb.config import Settings
 import shutil
-
-import streamlit as st  # Optional for visualization
+import streamlit as st
+import time
 
 load_dotenv()
 
@@ -22,38 +20,44 @@ class ChromaDBManager:
     Manages ChromaDB initialization and operations.
     """
 
-    def __init__(self, persist_directory: str):
+    def __init__(self, persist_directory: str, embedding_model: str = "chroma_default"):
         self.persist_directory = persist_directory
-
-        # Create directory if it doesn't exist
         os.makedirs(persist_directory, exist_ok=True)
 
-        # Initialize embeddings
-        self.embedding_function = OpenAIEmbeddings()
+        if embedding_model == "chroma_default":
+            try:
+                from langchain_community.embeddings import HuggingFaceEmbeddings
+                self.embedding_function = HuggingFaceEmbeddings(
+                    model_name="sentence-transformers/all-MiniLM-L6-v2"
+                )
+                st.info("Using HuggingFace embeddings (chroma_default)")
+            except ImportError:
+                st.warning("sentence-transformers not installed, falling back to Ollama")
+                self.embedding_function = OllamaEmbeddings(
+                    model="nomic-embed-text:latest",
+                    base_url="http://localhost:11434",
+                )
+        else:
+            self.embedding_function = OllamaEmbeddings(
+                model=embedding_model,
+                base_url="http://localhost:11434",
+            )
 
     def create_or_load_db(self, collection_name: str = "document_collection") -> Chroma:
         """Creates a new ChromaDB instance or loads existing one."""
         try:
-            # Initialize Chroma with new package
             vector_store = Chroma(
                 collection_name=collection_name,
                 embedding_function=self.embedding_function,
                 persist_directory=self.persist_directory,
             )
-
             print(f"Successfully initialized ChromaDB collection: {collection_name}")
-
-            # Get collection info safely
             try:
-                collection_size = (
-                    len(vector_store.get()["ids"]) if vector_store.get() else 0
-                )
+                collection_size = len(vector_store.get()["ids"]) if vector_store.get() else 0
                 print(f"Collection size: {collection_size} documents")
             except:
                 print("New collection created")
-
             return vector_store
-
         except Exception as e:
             print(f"Error initializing ChromaDB: {e}")
             return None
@@ -70,7 +74,7 @@ class ChromaDBManager:
 
 
 class DocumentProcessor:
-    def __init__(self, chunk_size: int = 1000, chunk_overlap: int = 200):
+    def __init__(self, chunk_size: int = 500, chunk_overlap: int = 50):
         self.text_splitter = RecursiveCharacterTextSplitter(
             chunk_size=chunk_size,
             chunk_overlap=chunk_overlap,
@@ -110,20 +114,26 @@ class DocumentProcessor:
             st.error(f"Error splitting documents: {str(e)}")
             return documents
 
-    def process_and_store(
-            self, documents: List[Document], vector_store: Chroma
-    ) -> bool:
-        """Process documents and store in vector store."""
+    def process_and_store(self, documents: List[Document], vector_store: Chroma) -> bool:
+        """Process documents and store in vector store with batching."""
         try:
             if not documents:
                 st.warning("No documents to process")
                 return False
 
-            # Add documents to vector store
-            vector_store.add_documents(documents)
+            batch_size = 5
+            total = len(documents)
+            progress_bar = st.progress(0)
 
-            # In the new version, we don't need to explicitly persist
-            st.success(f"Successfully added {len(documents)} documents to vector store")
+            for i in range(0, total, batch_size):
+                batch = documents[i:i+batch_size]
+                vector_store.add_documents(batch)
+                progress = min(i + batch_size, total) / total
+                progress_bar.progress(progress)
+                st.info(f"Processed {min(i+batch_size, total)}/{total} chunks")
+                time.sleep(1)
+
+            st.success(f"Successfully added {total} documents to vector store")
             return True
         except Exception as e:
             st.error(f"Error storing documents: {str(e)}")
@@ -135,8 +145,12 @@ class QueryExpander:
     Expands a single query into multiple semantically similar variations.
     """
 
-    def __init__(self, temperature: float = 0):
-        self.llm = ChatOpenAI(temperature=temperature, model="gpt-4o-mini")
+    def __init__(self, temperature: float = 0, model_name: str = "llama3.2"):  # ← по умолчанию легкая
+        self.llm = ChatOllama(
+            model=model_name,
+            temperature=temperature,
+            num_predict=500,
+        )
 
         self.query_expansion_prompt = PromptTemplate(
             input_variables=["question"],
@@ -157,20 +171,24 @@ class QueryExpander:
     def expand_query(self, question: str) -> List[str]:
         """
         Expand a single query into multiple variations.
-
-        Args:
-            question: Original question to expand
-
-        Returns:
-            List of query variations including the original
         """
         try:
             response = self.llm.invoke(
                 self.query_expansion_prompt.format(question=question)
             )
-            variations = [
-                line.split(". ")[1] for line in response.content.strip().split("\n")
-            ]
+            content = response.content if hasattr(response, 'content') else str(response)
+
+            variations = []
+            for line in content.strip().split("\n"):
+                if line.strip() and ". " in line:
+                    try:
+                        variations.append(line.split(". ", 1)[1])
+                    except:
+                        continue
+
+            if not variations:
+                return [question]
+
             variations.append(question)
             return variations
         except Exception as e:
@@ -190,18 +208,9 @@ class QueryExpansionRAG:
             search_type="similarity", search_kwargs={"k": 5}
         )
 
-    def retrieve_with_expansion(
-            self, question: str, top_k: int = 5
-    ) -> Dict[str, List[Document]]:
+    def retrieve_with_expansion(self, question: str, top_k: int = 5) -> Dict[str, List[Document]]:
         """
         Retrieve documents using query expansion.
-
-        Args:
-            question: Original question
-            top_k: Number of documents to retrieve per query
-
-        Returns:
-            Dictionary mapping queries to their retrieved documents
         """
         expanded_queries = self.query_expander.expand_query(question)
         results = {}
@@ -213,15 +222,17 @@ class QueryExpansionRAG:
         return results
 
 
-### === Add the Answer Generator ===  Final part###
-# Add this new class for final answer generation
 class AnswerGenerator:
     """
     Generates final answer from multiple document sources using LLM with proper citations.
     """
 
-    def __init__(self, temperature: float = 0):
-        self.llm = ChatOpenAI(temperature=temperature, model="gpt-4o-mini")
+    def __init__(self, temperature: float = 0, model_name: str = "llama3.2"):
+        self.llm = ChatOllama(
+            model=model_name,
+            temperature=temperature,
+            num_predict=1500,
+        )
 
         self.answer_generation_prompt = PromptTemplate(
             input_variables=["question", "formatted_context"],
@@ -263,29 +274,18 @@ class AnswerGenerator:
     def _prepare_citation_chunks(
             self, results: Dict[str, List[Document]], max_chunk_length: int = 250
     ) -> Tuple[str, Dict[str, Dict[str, str]]]:
-        """
-        Prepare context with citations and create a citation map.
-
-        Args:
-            results: Dictionary of query->documents mappings
-            max_chunk_length: Maximum length for document chunks
-
-        Returns:
-            Tuple of (formatted_context, citation_map)
-        """
+        """Prepare context with citations."""
         citation_id = 1
         citation_chunks = []
         citation_map = {}
 
         for query, docs in results.items():
             for doc in docs:
-                # Create a truncated chunk with context
                 content = doc.page_content
                 truncated_content = content[:max_chunk_length]
                 if len(content) > max_chunk_length:
                     truncated_content += "..."
 
-                # Store the citation
                 citation_ref = f"[Citation{citation_id}]"
                 citation_chunks.append(f"{citation_ref}:\n{truncated_content}\n")
                 citation_map[citation_ref] = {
@@ -301,29 +301,20 @@ class AnswerGenerator:
     def generate_answer(
             self, question: str, results: Dict[str, List[Document]]
     ) -> Dict[str, Any]:
-        """
-        Generate final answer from multiple search results with citations.
-
-        Args:
-            question: Original question
-            results: Dictionary of query->documents mappings
-
-        Returns:
-            Dictionary containing answer and citation information
-        """
+        """Generate final answer with citations."""
         try:
-            # Prepare context with citations
             formatted_context, citation_map = self._prepare_citation_chunks(results)
 
-            # Generate answer using LLM
             response = self.llm.invoke(
                 self.answer_generation_prompt.format(
                     question=question, formatted_context=formatted_context
                 )
             )
 
+            answer_content = response.content if hasattr(response, 'content') else str(response)
+
             return {
-                "answer": response.content,
+                "answer": answer_content,
                 "citations": citation_map,
                 "formatted_context": formatted_context,
             }
@@ -338,60 +329,63 @@ class AnswerGenerator:
 
 
 def main():
-    st.set_page_config(page_title="RAG Query Expansion", layout="wide")
+    st.set_page_config(page_title="RAG Query Expansion (Ollama)", layout="wide")
 
-    st.title("RAG System with Query Expansion")
+    st.title("RAG System with Query Expansion (Ollama)")
 
-    # Initialize paths with absolute paths
     current_dir = os.path.dirname(os.path.abspath(__file__))
     pdf_directory = os.path.join(current_dir, "data")
     persist_directory = os.path.join(current_dir, "chromadb")
 
-    # Create directories if they don't exist
     os.makedirs(pdf_directory, exist_ok=True)
     os.makedirs(persist_directory, exist_ok=True)
 
-    # Display directory information
+    st.sidebar.title("Model Configuration")
+
+    embedding_model = st.sidebar.selectbox(
+        "Embedding Model",
+        ["chroma_default", "nomic-embed-text:latest", "qwen3-embedding:4b"],
+        help="chroma_default uses HuggingFace (no Ollama) — most stable"
+    )
+
+    llm_model = st.sidebar.selectbox(
+        "LLM Model",
+        ["llama3.2:latest", "llama3.1:latest", "qwen3:8b", "qwen3:14b", "gemma4:12b"],
+        help="Model for generating answers"
+    )
+
     st.sidebar.title("System Information")
     st.sidebar.info(f"PDF Directory: {pdf_directory}")
     st.sidebar.info(f"Database Directory: {persist_directory}")
 
     collection_name = "pdf_collection"
 
-    # Sidebar controls
     st.sidebar.title("Controls")
 
-    # File uploader for PDFs
     uploaded_files = st.sidebar.file_uploader(
         "Upload PDF files", type="pdf", accept_multiple_files=True
     )
 
     if uploaded_files:
         st.sidebar.success(f"Uploaded {len(uploaded_files)} files")
-        # Save uploaded files to pdf_directory
         for uploaded_file in uploaded_files:
             with open(os.path.join(pdf_directory, uploaded_file.name), "wb") as f:
                 f.write(uploaded_file.getvalue())
 
-    # Database reset button
     if st.sidebar.button("Reset Database"):
         if "db_manager" in st.session_state:
             st.session_state.db_manager.reset_database()
             st.sidebar.success("Database reset successfully!")
-            # Clear session state
             for key in ["db_manager", "vector_store", "last_results"]:
                 if key in st.session_state:
                     del st.session_state[key]
 
-    # Initialize system components when button is clicked
     if st.sidebar.button("Initialize System"):
         with st.spinner("Initializing system..."):
             try:
-                # Create DB Manager
-                db_manager = ChromaDBManager(persist_directory)
+                db_manager = ChromaDBManager(persist_directory, embedding_model)
                 st.session_state["db_manager"] = db_manager
 
-                # Create or load vector store
                 vector_store = db_manager.create_or_load_db(collection_name)
 
                 if vector_store:
@@ -401,8 +395,8 @@ def main():
                     st.sidebar.error("Failed to initialize vector store")
             except Exception as e:
                 st.sidebar.error(f"Error initializing system: {str(e)}")
+                st.exception(e)
 
-    # Process documents when button is clicked
     if st.sidebar.button("Process Documents"):
         if "vector_store" not in st.session_state:
             st.sidebar.error("Please initialize the system first")
@@ -423,35 +417,24 @@ def main():
                 else:
                     st.sidebar.error("No documents found")
 
-    # Main query interface
     st.header("Query Interface")
 
-    # Text input for query
     query = st.text_input("Enter your question:")
-
-    # Number of results slider
     k = st.slider("Number of results to return", min_value=1, max_value=10, value=3)
 
-    ## What are the key findings presented?
-    # Search button
-    # Search button
     if st.button("Search"):
         if query and "vector_store" in st.session_state:
             with st.spinner("Processing query..."):
                 try:
-                    # Initialize query expander and answer generator
-                    query_expander = QueryExpander()
-                    answer_generator = AnswerGenerator()
+                    query_expander = QueryExpander(model_name=llm_model)
+                    answer_generator = AnswerGenerator(model_name=llm_model)
 
-                    # Expand query
                     expanded_queries = query_expander.expand_query(query)
 
-                    # Display expanded queries
                     with st.expander("🔍 View Expanded Queries"):
                         for i, exp_query in enumerate(expanded_queries, 1):
                             st.write(f"{i}. {exp_query}")
 
-                    # Search with each expanded query
                     all_results = {}
                     for exp_query in expanded_queries:
                         results = st.session_state.vector_store.similarity_search(
@@ -459,35 +442,26 @@ def main():
                         )
                         all_results[exp_query] = results
 
-                    # Generate final answer with citations
                     st.subheader("📝 Detailed Analysis")
                     with st.spinner("Generating comprehensive answer..."):
                         response_data = answer_generator.generate_answer(
                             query, all_results
                         )
 
-                        # Display the answer
                         st.markdown(response_data["answer"])
 
-                        # Display citations
                         st.subheader("📚 Source Citations")
-                        for citation_id, citation_data in response_data[
-                            "citations"
-                        ].items():
+                        for citation_id, citation_data in response_data["citations"].items():
                             with st.expander(f"{citation_id} - Click to view source"):
                                 st.markdown("**Excerpt:**")
                                 st.markdown(f"```\n{citation_data['content']}\n```")
                                 st.markdown("**Original Query:**")
                                 st.markdown(f"*{citation_data['query']}*")
 
-                                # Option to view full content
                                 if st.button(f"View Full Content for {citation_id}"):
                                     st.markdown("**Full Content:**")
-                                    st.markdown(
-                                        f"```\n{citation_data['full_content']}\n```"
-                                    )
+                                    st.markdown(f"```\n{citation_data['full_content']}\n```")
 
-                    # Option to view all search results
                     with st.expander("🔎 View All Search Results"):
                         for query_text, docs in all_results.items():
                             st.markdown(f"**Query:** {query_text}")
@@ -496,7 +470,6 @@ def main():
                                 st.markdown(f"```\n{doc.page_content[:500]}...\n```")
                                 st.markdown("---")
 
-                    # Generate final synthesized answer
                     st.subheader("🎯 Final Answer")
                     with st.spinner("Synthesizing final answer..."):
                         final_prompt = PromptTemplate(
@@ -519,19 +492,25 @@ def main():
                             Final Answer:""",
                         )
 
-                        final_response = ChatOpenAI(temperature=0).invoke(
+                        final_llm = ChatOllama(
+                            model=llm_model,
+                            temperature=0,
+                            num_predict=1000,
+                        )
+                        final_response = final_llm.invoke(
                             final_prompt.format(
                                 question=query, detailed_answer=response_data["answer"]
                             )
                         )
 
-                        # Display final answer in a highlighted box
+                        final_content = final_response.content if hasattr(final_response, 'content') else str(final_response)
+
                         st.markdown("---")
                         st.markdown("### 💡 Summary")
                         st.markdown(
                             f"""
                             <div style='background-color: #f0f2f6; padding: 20px; border-radius: 10px;'>
-                            {final_response.content}
+                            {final_content}
                             </div>
                             """,
                             unsafe_allow_html=True,
@@ -539,14 +518,12 @@ def main():
 
                 except Exception as e:
                     st.error(f"Error during search: {str(e)}")
-                    st.error("Full error:", exception=e)
         else:
             if "vector_store" not in st.session_state:
                 st.error("Please initialize the system first")
             if not query:
                 st.error("Please enter a query")
 
-    # Display system status
     st.sidebar.markdown("---")
     st.sidebar.subheader("System Status")
     if "vector_store" in st.session_state:
